@@ -1,0 +1,33 @@
+# Swift / SPM
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary Artifacts & Logs
+*.log
+*.metallib
+*.pid
+curl_out.txt
+sample.txt
+tmp/
+/homesec-benchmark/
+/SwiftBuddy/build/
+/swiftbuddy-registry/
+3rd_party/
+.agents/harness/audio-omni-gemma4/runs/
+.venv/
+mem-palace/
+
+
+tests/DFlash/intermediates/

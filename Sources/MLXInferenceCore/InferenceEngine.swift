@@ -1,0 +1,503 @@
+// InferenceEngine.swift — Core MLX inference engine for SwiftLM Chat
+// Handles: model load/unload, token streaming, memory/thermal pressure response.
+
+import Foundation
+import MLX
+import MLXLLM
+import MLXLMCommon
+import MLXVLM
+import Hub
+import Tokenizers
+#if canImport(UIKit)
+import UIKit
+#endif
+
+// MARK: — Hub Downloader bridge (Downloader protocol conformance over HubApi)
+
+private struct HubDownloader: Downloader, Sendable {
+    let hub: HubApi
+    func download(
+        id: String, revision: String?,
+        matching patterns: [String],
+        useLatest: Bool,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> URL {
+        try await hub.snapshot(
+            from: id,
+            matching: patterns,
+            progressHandler: progressHandler)
+    }
+}
+
+// MARK: — swift-transformers TokenizerLoader bridge
+
+private struct TransformersTokenizerLoader: TokenizerLoader, Sendable {
+    func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        let upstream = try await AutoTokenizer.from(modelFolder: directory)
+        return TransformersTokenizerBridge(upstream)
+    }
+}
+
+private struct TransformersTokenizerBridge: MLXLMCommon.Tokenizer, Sendable {
+    let upstream: any Tokenizers.Tokenizer
+    init(_ upstream: any Tokenizers.Tokenizer) { self.upstream = upstream }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+    }
+    func convertTokenToId(_ token: String) -> Int? { upstream.convertTokenToId(token) }
+    func convertIdToToken(_ id: Int) -> String? { upstream.convertIdToToken(id) }
+    var bosToken: String? { upstream.bosToken }
+    var eosToken: String? { upstream.eosToken }
+    var unknownToken: String? { upstream.unknownToken }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        do {
+            return try upstream.applyChatTemplate(
+                messages: messages, tools: tools, additionalContext: additionalContext)
+        } catch Tokenizers.TokenizerError.missingChatTemplate {
+            throw MLXLMCommon.TokenizerError.missingChatTemplate
+        }
+    }
+}
+
+
+// MARK: — Model State
+
+public enum ModelState: Equatable, Sendable {
+    case idle
+    case downloading(progress: Double, speed: String)
+    case loading
+    case ready(modelId: String)
+    case generating
+    case error(String)
+}
+
+// MARK: — Thermal State
+
+public enum ThermalLevel: Sendable {
+    case nominal, fair, serious, critical
+    public var displayString: String {
+        switch self {
+        case .nominal: return "Normal"
+        case .fair:    return "Warm"
+        case .serious: return "Hot — generation may be slow"
+        case .critical: return "Critical — generation paused"
+        }
+    }
+    public var isThrottled: Bool { self == .serious || self == .critical }
+}
+
+// MARK: — Generation Token
+
+public struct GenerationToken: Sendable {
+    public let text: String
+    public let isThinking: Bool
+
+    public init(text: String, isThinking: Bool = false) {
+        self.text = text
+        self.isThinking = isThinking
+    }
+}
+
+// MARK: — InferenceEngine
+
+@MainActor
+public final class InferenceEngine: ObservableObject {
+    @Published public private(set) var state: ModelState = .idle
+    @Published public private(set) var thermalLevel: ThermalLevel = .nominal
+    @Published public private(set) var activeContextTokens: Int = 0
+    @Published public private(set) var maxContextWindow: Int = 0
+
+    /// Whether to automatically unload the model when the app backgrounds
+    /// and reload it when returning to foreground.
+    /// Defaults to true on iOS (prevents jetsam), false on macOS.
+    public var autoOffloadOnBackground: Bool = {
+        #if os(iOS)
+        return true
+        #else
+        return false
+        #endif
+    }()
+
+    /// Shared download + storage manager.
+    public let downloadManager = ModelDownloadManager()
+
+    private var container: ModelContainer?
+    private var currentModelId: String?
+    /// The ID of the last model that was successfully loaded. Remains set during .generating.
+    public var loadedModelId: String? { currentModelId }
+    private var generationTask: Task<Void, Never>?
+
+    // All NotificationCenter observers collected for clean deregistration
+    // nonisolated(unsafe): populated exclusively from MainActor init, read only in deinit
+    // after all strong references have dropped — no concurrent access possible.
+    // Declared nonisolated(unsafe) to satisfy Swift 6 deinit isolation rules.
+    nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
+
+    // Tracks the model ID active before app backgrounding so we can restore it on foreground.
+    private var backgroundedModelId: String?
+    /// Timestamp of when the app entered background. Used to implement a
+    /// grace-period: short background sessions (<30 s) skip the unload cycle.
+    private var backgroundedAt: Date?
+    private static let backgroundGracePeriod: TimeInterval = 30
+
+    public init() {
+        setupPressureHandlers()
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    // MARK: — Pressure Handlers
+
+    private func setupPressureHandlers() {
+        #if canImport(UIKit)
+        // ── REACTIVE: Memory warning (last resort) ────────────────────────────
+        // OS sends this *after* pressure builds. We still handle it as a fallback
+        // in case the proactive unload wasn't triggered (e.g. app was already
+        // under pressure from another process).
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didReceiveMemoryWarningNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if case .generating = self.state { return }  // don't interrupt mid-stream
+                    self.unload()
+                    self.state = .error("Unloaded due to memory pressure. Tap to reload.")
+                }
+            }
+        )
+
+        // ── PROACTIVE: App entered background ───────────────────────────────
+        // didEnterBackground fires ONLY when the user truly leaves the app
+        // (home gesture / Lock button). willResignActive fires too broadly:
+        // notification banners, screenshots, system alerts — all trigger it.
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didEnterBackgroundNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.autoOffloadOnBackground else { return }
+
+                    self.backgroundedAt = Date()
+
+                    // Only remember model ID when it was actually loaded.
+                    switch self.state {
+                    case .ready(let id):  self.backgroundedModelId = id
+                    case .generating:     self.backgroundedModelId = self.currentModelId
+                    default:              self.backgroundedModelId = nil
+                    }
+
+                    self.stopGeneration()
+                    self.unload()
+                    self.state = .idle
+                }
+            }
+        )
+
+        // ── PROACTIVE: App returning to foreground ───────────────────────────
+        // willEnterForeground fires before the app is fully active, giving us
+        // time to start reloading before the UI appears.
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.autoOffloadOnBackground else { return }
+
+                    // Grace period: if the user was gone for less than 30 seconds
+                    // (e.g. a brief app-switcher peek), don't burn time reloading.
+                    let elapsed = self.backgroundedAt.map { Date().timeIntervalSince($0) } ?? 999
+                    self.backgroundedAt = nil
+
+                    guard elapsed >= Self.backgroundGracePeriod else {
+                        // Short absence — stay idle, let the user decide what to do.
+                        self.backgroundedModelId = nil
+                        return
+                    }
+
+                    let modelToReload = self.backgroundedModelId
+                        ?? self.downloadManager.lastLoadedModelId
+                    self.backgroundedModelId = nil
+                    if let modelId = modelToReload {
+                        await self.load(modelId: modelId)
+                    }
+                }
+            }
+        )
+        #endif
+
+        // ── Thermal state monitoring (all platforms) ──────────────────────────
+        observers.append(
+            NotificationCenter.default.addObserver(
+                forName: ProcessInfo.thermalStateDidChangeNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.updateThermalLevel()
+                }
+            }
+        )
+        updateThermalLevel()
+    }
+
+    private func updateThermalLevel() {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:  thermalLevel = .nominal
+        case .fair:     thermalLevel = .fair
+        case .serious:  thermalLevel = .serious
+        case .critical:
+            thermalLevel = .critical
+            // Critical: stop any generation immediately
+            stopGeneration()
+        @unknown default: thermalLevel = .nominal
+        }
+    }
+
+    // MARK: — Model Loading
+
+    /// Load a model by HuggingFace ID. Downloads if not cached.
+    /// Uses ModelStorage.cacheRoot as the HubApi download base.
+    /// For MoE models, activates expert streaming via ExpertStreamingConfig so
+    /// only active expert weights are resident in RAM during inference.
+    public func load(modelId: String) async {
+        guard state != .ready(modelId: modelId) else { return }
+        guard !thermalLevel.isThrottled else {
+            state = .error("Device is too hot. Let it cool before loading a model.")
+            return
+        }
+
+        state = .loading
+        currentModelId = modelId
+
+        do {
+            let hub = HubApi(downloadBase: ModelStorage.cacheRoot)
+
+            // For MoE models, enable expert streaming before loading so
+            // loadWeights() initialises ExpertStreamerManager correctly.
+            // lazyLoad=true means weights are mmap'd and not paged into RAM
+            // at load time — only active expert pages touch RAM during inference.
+            var config = ModelConfiguration(id: modelId)
+            let isMoE = ModelCatalog.all.first(where: { $0.id == modelId })?.isMoE ?? false
+            if isMoE {
+                config.lazyLoad = true
+                let modelDir = ModelStorage.snapshotDirectory(for: modelId)
+                // directIO=true on macOS (5 GB/s NVMe pread), false on iOS (mmap fallback)
+                ExpertStreamingConfig.shared.activate(
+                    modelDirectory: modelDir,
+                    useDirectIO: {
+                        #if os(macOS)
+                        return true
+                        #else
+                        return false
+                        #endif
+                    }()
+                )
+            }
+
+            let downloader = HubDownloader(hub: hub)
+            let architecture = try await ModelArchitectureProbe.inspect(
+                configuration: config,
+                downloader: downloader
+            )
+
+            if architecture.supportsVision {
+                container = try await VLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: TransformersTokenizerLoader(),
+                    configuration: config
+                ) { [weak self] progress in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        let pct = progress.fractionCompleted
+                        let speedBytesPerSec = progress.userInfo[ProgressUserInfoKey("throughputKey")] as? Double
+                        let speedStr = speedBytesPerSec
+                            .map { String(format: "%.1f MB/s", $0 / 1_000_000) } ?? ""
+                        self.state = .downloading(progress: pct, speed: speedStr)
+
+                        self.downloadManager.updateProgress(ModelDownloadProgress(
+                            modelId: modelId,
+                            fractionCompleted: pct,
+                            currentFile: "",
+                            speedMBps: speedBytesPerSec.map { $0 / 1_000_000 }
+                        ))
+                    }
+                }
+            } else {
+                container = try await LLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: TransformersTokenizerLoader(),
+                    configuration: config
+                ) { [weak self] progress in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        let pct = progress.fractionCompleted
+                        let speedBytesPerSec = progress.userInfo[ProgressUserInfoKey("throughputKey")] as? Double
+                        let speedStr = speedBytesPerSec
+                            .map { String(format: "%.1f MB/s", $0 / 1_000_000) } ?? ""
+                        self.state = .downloading(progress: pct, speed: speedStr)
+
+                        self.downloadManager.updateProgress(ModelDownloadProgress(
+                            modelId: modelId,
+                            fractionCompleted: pct,
+                            currentFile: "",
+                            speedMBps: speedBytesPerSec.map { $0 / 1_000_000 }
+                        ))
+                    }
+                }
+            }
+
+            downloadManager.clearProgress(modelId: modelId)
+            downloadManager.lastLoadedModelId = modelId
+            downloadManager.refresh()
+            state = .ready(modelId: modelId)
+
+        } catch {
+            ExpertStreamingConfig.shared.deactivate()
+            downloadManager.clearProgress(modelId: modelId)
+            state = .error("Failed to load \(modelId): \(error.localizedDescription)")
+            container = nil
+        }
+    }
+
+    /// Unload the current model and free all GPU memory.
+    public func unload() {
+        generationTask?.cancel()
+        container = nil
+        currentModelId = nil
+        state = .idle
+        ExpertStreamingConfig.shared.deactivate()
+        MLX.Memory.cacheLimit = 0
+    }
+
+    // MARK: — Generation
+
+    public nonisolated func generate(
+        messages: [ChatMessage],
+        config: GenerationConfig = .default
+    ) -> AsyncStream<GenerationToken> {
+        AsyncStream { continuation in
+            Task { @MainActor in
+                guard let container = self.container else {
+                    continuation.finish(); return
+                }
+
+                // Don't generate when throttled
+                if self.thermalLevel == .critical {
+                    continuation.yield(GenerationToken(text: "\n\n[Generation paused: device temperature critical]"))
+                    continuation.finish(); return
+                }
+
+                self.state = .generating
+
+                do {
+                    var finalMessages: [[String: String]] = []
+                    var pendingSystemContext = ""
+                    
+                    for msg in messages {
+                        if msg.role == .system {
+                            pendingSystemContext += msg.content + "\n\n"
+                        } else {
+                            var roleRaw = msg.role.rawValue
+                            if roleRaw == "assistant" { roleRaw = "model" }
+                            var content = msg.content
+                            
+                            if roleRaw == "user" && !pendingSystemContext.isEmpty {
+                                content = "[SYSTEM CONTEXT / PERSONA DATA]\n" + pendingSystemContext + "\n[END CONTEXT]\n\n" + content
+                                pendingSystemContext = "" // Clear after injecting
+                            }
+                            finalMessages.append(["role": roleRaw, "content": content])
+                        }
+                    }
+                    
+                    let mlxMessages = finalMessages
+                    var params = GenerateParameters(temperature: config.temperature)
+                    params.topP = config.topP
+                    params.topK = config.topK
+                    params.minP = config.minP
+                    params.repetitionPenalty = config.repetitionPenalty
+                    params.repetitionContextSize = 20
+
+                    var thinkingActive = false
+                    var outputText = ""
+                    var tokenCount = 0
+
+                    let userInput = UserInput(messages: mlxMessages)
+                    let lmInput = try await container.prepare(input: userInput)
+                    
+                    // Approximate the input token size (as LMInput wrapper blocks direct inspection without private API)
+                    // MLX often counts 1 word roughly as 1.3 tokens. 
+                    let stringLength = mlxMessages.map { ($0["content"] ?? "").count }.reduce(0, +)
+                    let baseTokens = Int(Double(stringLength) / 3.5)
+                    self.activeContextTokens = baseTokens
+                    
+                    // If we have a max length config, expose it
+                    // TODO: Safely extract from ModelConfiguration when MLX exposes it dynamically
+                    self.maxContextWindow = 8192
+                    
+                    let stream: AsyncStream<Generation> = try await container.generate(
+                        input: lmInput,
+                        parameters: params
+                    )
+
+                    for await generation in stream {
+                        guard !Task.isCancelled else { break }
+
+                        if case .chunk(let text, tokenId: _) = generation {
+                            outputText += text
+                            tokenCount += 1
+                            
+                            // Update the UI token counter periodically to save CPU
+                            if tokenCount % 10 == 0 {
+                                self.activeContextTokens = baseTokens + tokenCount
+                            }
+
+                            if tokenCount >= config.maxTokens { break }
+                            
+                            // Hard-stop constraint for Gemma 2/3 and DeepSeek MoE bounds since MLX fails to parse multi-array JSON eos_token_id manifests.
+                            if outputText.contains("<end_of_turn>") || outputText.contains("<|im_end|>") || outputText.contains("<|eot_id|>") {
+                                let clamped = text.replacingOccurrences(of: "<end_of_turn>", with: "")
+                                                  .replacingOccurrences(of: "<|im_end|>", with: "")
+                                                  .replacingOccurrences(of: "<|eot_id|>", with: "")
+                                continuation.yield(GenerationToken(text: clamped, isThinking: thinkingActive))
+                                break
+                            }
+
+                            if config.enableThinking {
+                                if outputText.contains("<think>") && !outputText.contains("</think>") {
+                                    thinkingActive = true
+                                } else if outputText.contains("</think>") {
+                                    thinkingActive = false
+                                }
+                            }
+
+                            continuation.yield(GenerationToken(text: text, isThinking: thinkingActive))
+                        }
+                    }
+                } catch {
+                    continuation.yield(GenerationToken(text: "\n\n[Error: \(error.localizedDescription)]"))
+                }
+
+                self.state = self.currentModelId.map { .ready(modelId: $0) } ?? .idle
+                continuation.finish()
+            }
+        }
+    }
+
+    public func stopGeneration() {
+        generationTask?.cancel()
+        generationTask = nil
+        if let id = currentModelId { state = .ready(modelId: id) }
+    }
+}

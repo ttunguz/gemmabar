@@ -37,12 +37,22 @@ final class DictationController: NSObject, ObservableObject {
             if case .recording = self { return true }
             return false
         }
+
+        var canStartRecording: Bool {
+            switch self {
+            case .idle, .error:
+                return true
+            case .recording, .transcribing, .cleaning:
+                return false
+            }
+        }
     }
 
     private let serverController: ServerController
     private var recorder: AVAudioRecorder?
     private var recordingURL: URL?
     private var tempDirectory: URL?
+    private var lastToggleDate = Date.distantPast
 
     @Published private(set) var state: State = .idle
     @Published private(set) var lastTranscript: String = ""
@@ -53,9 +63,20 @@ final class DictationController: NSObject, ObservableObject {
     }
 
     func toggleRecording() {
+        let now = Date()
+        guard now.timeIntervalSince(lastToggleDate) > 0.75 else {
+            Self.log("Dictation toggle ignored by debounce; state=\(state.menuTitle)")
+            return
+        }
+        lastToggleDate = now
+
         if state.isRecording {
             Task { await stopAndProcessRecording() }
         } else {
+            guard state.canStartRecording else {
+                Self.log("Dictation toggle ignored while busy; state=\(state.menuTitle)")
+                return
+            }
             do {
                 try startRecording()
             } catch {
@@ -65,7 +86,7 @@ final class DictationController: NSObject, ObservableObject {
     }
 
     func startRecording() throws {
-        guard !state.isRecording else { return }
+        guard state.canStartRecording else { return }
 
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("GemmaBar-\(UUID().uuidString)", isDirectory: true)
@@ -92,6 +113,7 @@ final class DictationController: NSObject, ObservableObject {
         self.recordingURL = url
         self.recorder = recorder
         self.state = .recording(Date())
+        Self.log("Dictation recording started: \(url.path)")
     }
 
     func stopAndProcessRecording() async {
@@ -107,9 +129,12 @@ final class DictationController: NSObject, ObservableObject {
             let cleaned = normalizeDictationTerms(try await cleanWithGemma(transcript: transcript))
             lastTranscript = cleaned
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(cleaned, forType: .string)
+            let clipboardWritten = NSPasteboard.general.setString(cleaned, forType: .string)
+            Self.log("Dictation cleaned \(cleaned.count) chars; clipboardWritten=\(clipboardWritten)")
             state = .idle
+            Self.pasteClipboardIntoFrontmostApp()
         } catch {
+            Self.log("Dictation failed: \(error.localizedDescription)")
             state = .error(error.localizedDescription)
         }
 
@@ -276,7 +301,7 @@ final class DictationController: NSObject, ObservableObject {
         return environment
     }
 
-    private nonisolated static func log(_ message: String) {
+    nonisolated static func log(_ message: String) {
         let line = "[\(Date())] \(message)\n"
         let url = URL(fileURLWithPath: "/tmp/gemmabar.log")
         guard let data = line.data(using: .utf8) else { return }
@@ -287,6 +312,19 @@ final class DictationController: NSObject, ObservableObject {
             try? handle.close()
         } else {
             try? data.write(to: url)
+        }
+    }
+
+    private nonisolated static func pasteClipboardIntoFrontmostApp() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            let source = CGEventSource(stateID: .combinedSessionState)
+            let commandKey = CGEventFlags.maskCommand
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
+            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+            keyDown?.flags = commandKey
+            keyUp?.flags = commandKey
+            keyDown?.post(tap: .cghidEventTap)
+            keyUp?.post(tap: .cghidEventTap)
         }
     }
 }

@@ -128,6 +128,7 @@ final class DictationController: NSObject, ObservableObject {
 
     private nonisolated static func runParakeet(audioURL: URL) throws -> String {
         let parakeetBin = try resolveParakeetBinary()
+        log("Resolved Parakeet binary: \(parakeetBin)")
         let outputDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("GemmaBar-Parakeet-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -250,7 +251,10 @@ final class DictationController: NSObject, ObservableObject {
 
     private nonisolated static func resolveParakeetBinary() throws -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        var candidates: [String] = []
+        var candidates: [String] = [
+            home.appendingPathComponent("Documents/coding/parakeet/.venv/bin/parakeet-mlx").path,
+            home.appendingPathComponent(".local/bin/parakeet-mlx").path
+        ]
         if let resourceURL = Bundle.main.resourceURL {
             candidates.append(
                 resourceURL
@@ -259,10 +263,6 @@ final class DictationController: NSObject, ObservableObject {
                     .path
             )
         }
-        candidates += [
-            home.appendingPathComponent("Documents/coding/parakeet/.venv/bin/parakeet-mlx").path,
-            home.appendingPathComponent(".local/bin/parakeet-mlx").path
-        ]
         if let binary = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
             return binary
         }
@@ -274,6 +274,20 @@ final class DictationController: NSObject, ObservableObject {
         let binDirectory = (binaryPath as NSString).deletingLastPathComponent
         environment["PATH"] = "\(binDirectory):" + (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
         return environment
+    }
+
+    private nonisolated static func log(_ message: String) {
+        let line = "[\(Date())] \(message)\n"
+        let url = URL(fileURLWithPath: "/tmp/gemmabar.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: url.path),
+           let handle = try? FileHandle(forWritingTo: url) {
+            try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
     }
 }
 

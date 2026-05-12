@@ -15,6 +15,7 @@ BUNDLE_MODELS="${BUNDLE_MODELS:-0}"
 BUNDLE_PARAKEET="${BUNDLE_PARAKEET:-0}"
 SIGN_IDENTITY="${SIGN_IDENTITY:-${GEMMABAR_SIGN_IDENTITY:--}}"
 ENTITLEMENTS="${ENTITLEMENTS:-Sources/GemmaBar/GemmaBar.entitlements}"
+ICON_PATH="${ICON_PATH:-Assets/GemmaBar/GemmaBar.icns}"
 VERIFY_GATEKEEPER="${VERIFY_GATEKEEPER:-0}"
 
 DICTATION_MODEL="${DICTATION_MODEL:-$HOME/Documents/coding/MLX/models/gemma-4-e4b-it-4bit}"
@@ -32,6 +33,11 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR/SwiftLM"
 cp "$TRIPLE_DIR/GemmaBar" "$MACOS_DIR/GemmaBar"
 cp "Sources/GemmaBar/Info.plist" "$APP_PATH/Contents/Info.plist"
 cp "$TRIPLE_DIR/SwiftLM" "$RESOURCES_DIR/SwiftLM/SwiftLM"
+if [[ -f "$ICON_PATH" ]]; then
+  cp "$ICON_PATH" "$RESOURCES_DIR/GemmaBar.icns"
+else
+  echo "warning: app icon not found: $ICON_PATH" >&2
+fi
 
 if [[ -f "$TRIPLE_DIR/mlx.metallib" ]]; then
   cp "$TRIPLE_DIR/mlx.metallib" "$RESOURCES_DIR/SwiftLM/mlx.metallib"

@@ -15,9 +15,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var serverController: ServerController!
     var dictationController: DictationController!
     private var customVocabularyWindow: NSWindow?
+    private var dictationShortcutWindow: NSWindow?
+    private var dictationShortcutController: DictationShortcutViewController?
     private var cancellables = Set<AnyCancellable>()
-    private var f2HotKeyRef: EventHotKeyRef?
-    private var f2HotKeyHandlerRef: EventHandlerRef?
+    private var dictationHotKeyRef: EventHotKeyRef?
+    private var dictationHotKeyHandlerRef: EventHandlerRef?
+    private var dictationShortcut = DictationShortcut.load()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -36,21 +39,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             await serverController.loadDefaultModel()
         }
 
-        installF2DictationHotkey()
+        installDictationHotkeyHandler()
+        registerDictationHotkey()
         requestAccessibilityPermissionForPaste()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let f2HotKeyRef {
-            UnregisterEventHotKey(f2HotKeyRef)
+        if let dictationHotKeyRef {
+            UnregisterEventHotKey(dictationHotKeyRef)
         }
-        if let f2HotKeyHandlerRef {
-            RemoveEventHandler(f2HotKeyHandlerRef)
+        if let dictationHotKeyHandlerRef {
+            RemoveEventHandler(dictationHotKeyHandlerRef)
         }
         serverController.stopServer()
     }
 
-    private func installF2DictationHotkey() {
+    private func installDictationHotkeyHandler() {
         Self.hotKeyOwner = self
 
         let callback: EventHandlerUPP = { _, event, _ in
@@ -84,18 +88,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             1,
             &eventType,
             nil,
-            &f2HotKeyHandlerRef
+            &dictationHotKeyHandlerRef
         )
+    }
 
-        let hotKeyID = EventHotKeyID(signature: 0x47424632, id: 1) // "GBF2"
-        RegisterEventHotKey(
-            UInt32(kVK_F2),
-            0,
+    private func registerDictationHotkey() {
+        if let dictationHotKeyRef {
+            UnregisterEventHotKey(dictationHotKeyRef)
+            self.dictationHotKeyRef = nil
+        }
+
+        let hotKeyID = EventHotKeyID(signature: 0x47424454, id: 1) // "GBDT"
+        let status = RegisterEventHotKey(
+            dictationShortcut.keyCode,
+            dictationShortcut.modifiers,
             hotKeyID,
             GetApplicationEventTarget(),
             0,
-            &f2HotKeyRef
+            &dictationHotKeyRef
         )
+        DictationLogger.log("Dictation hotkey \(dictationShortcut.displayName) registration status=\(status)")
     }
 
     private func requestAccessibilityPermissionForPaste() {
@@ -167,6 +179,53 @@ extension AppDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc func showDictationShortcut() {
+        DictationLogger.log("Dictation shortcut editor requested")
+        if let dictationShortcutWindow {
+            DictationLogger.log("Showing existing dictation shortcut window")
+            dictationShortcutWindow.makeKeyAndOrderFront(nil)
+            dictationShortcutWindow.orderFrontRegardless()
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 240),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Dictation Shortcut"
+        window.center()
+        window.level = .floating
+        window.isReleasedWhenClosed = false
+
+        let controller = DictationShortcutViewController(
+            shortcut: dictationShortcut,
+            onCancel: { [weak self] in
+                self?.dictationShortcutWindow?.close()
+            },
+            onSave: { [weak self] shortcut in
+                guard let self else { return }
+                self.dictationShortcut = shortcut
+                shortcut.save()
+                self.registerDictationHotkey()
+                self.objectWillChange.send()
+                DictationLogger.log("Dictation shortcut saved: \(shortcut.displayName)")
+                self.dictationShortcutWindow?.close()
+            }
+        )
+        window.contentViewController = controller
+
+        dictationShortcutWindow = window
+        dictationShortcutController = controller
+        window.delegate = self
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        DictationLogger.log("Dictation shortcut window opened")
+    }
+
     var menuStatusTitle: String {
         serverController?.state.menuTitle ?? "○ Starting"
     }
@@ -189,6 +248,10 @@ extension AppDelegate {
         }
         return "Start Dictation"
     }
+
+    var dictationShortcutTitle: String {
+        "Dictation Shortcut: \(dictationShortcut.displayName)"
+    }
 }
 
 extension AppDelegate: ServerControllerDelegate {
@@ -197,7 +260,13 @@ extension AppDelegate: ServerControllerDelegate {
 
 extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        guard notification.object as? NSWindow === customVocabularyWindow else { return }
-        customVocabularyWindow = nil
+        let window = notification.object as? NSWindow
+        if window === customVocabularyWindow {
+            customVocabularyWindow = nil
+        }
+        if window === dictationShortcutWindow {
+            dictationShortcutWindow = nil
+            dictationShortcutController = nil
+        }
     }
 }

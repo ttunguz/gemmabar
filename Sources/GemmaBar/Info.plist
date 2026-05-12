@@ -10,6 +10,8 @@
     <string>GemmaBar</string>
     <key>CFBundleDisplayName</key>
     <string>GemmaBar</string>
+    <key>CFBundleIconFile</key>
+    <string>GemmaBar</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

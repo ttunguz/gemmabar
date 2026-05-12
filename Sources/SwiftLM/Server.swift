@@ -1554,7 +1554,7 @@ func handleChatCompletion(
         // Skip for quantized-KV requests: the prompt cache stores KV state produced
         // with KVCacheSimple; restoring it into a QuantizedKVCache (or vice-versa)
         // is unsafe and produces incorrect results or runtime failures.
-        let skipPromptCache = isMultimodalRequest || params.kvBits != nil
+        let skipPromptCache = isMultimodalRequest || params.kvBits != nil || (chatReq.noPromptCache ?? false)
         var stream: AsyncStream<Generation>
         if !skipPromptCache, let cachedCount = await promptCache.restore(newTokens: promptTokens, into: cache) {
             // Cache hit: KV state is pre-populated up to cachedCount tokens.
@@ -1598,10 +1598,12 @@ func handleChatCompletion(
         let onPrefillDone: (() async -> Void)? = {
             if turboHasCompressed {
                 print("[SwiftLM] 🧠 Skipping prompt cache save — TurboQuant has compressed \(cache.compactMap { ($0 as? KVCacheSimple)?.compressedOffset }.max() ?? 0) tokens. Saving would decode ~37 GB back to fp16.")
-            } else if params.kvBits != nil {
+            } else if params.kvBits != nil || (chatReq.noPromptCache ?? false) {
                 // kv_bits is set: the cache contains QuantizedKVCache layers whose token
                 // format is incompatible with the FP16 KVCacheSimple format expected by
-                // promptCache.save. Skip saving to prevent unsafe mixed-format restores.
+                // promptCache.save. no_prompt_cache is a per-request opt-out for workloads
+                // where cache reuse is not worth the risk of cross-request text bleed.
+                // Skip saving to prevent unsafe mixed-format restores or unwanted reuse.
             } else {
                 await promptCache.save(tokens: promptTokens, cache: cache)
             }
@@ -2765,6 +2767,8 @@ struct ChatCompletionRequest: Decodable {
     /// Only 4 and 8 are supported by the underlying MLX QuantizedKVCache.
     /// Enables `QuantizedKVCache` instead of `KVCacheSimple`.  Separate from `--turbo-kv`.
     let kvBits: Int?
+    /// Per-request opt-out from server prompt KV reuse.
+    let noPromptCache: Bool?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature, tools, stop, seed
@@ -2780,6 +2784,7 @@ struct ChatCompletionRequest: Decodable {
         case chatTemplateKwargs = "chat_template_kwargs"
         case enableThinking = "enable_thinking"
         case kvBits = "kv_bits"
+        case noPromptCache = "no_prompt_cache"
     }
 }
 

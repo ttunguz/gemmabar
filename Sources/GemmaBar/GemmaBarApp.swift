@@ -72,6 +72,10 @@ struct GemmaBarApp: App {
             }
             .keyboardShortcut("v")
 
+            Button(appDelegate.dictationShortcutTitle) {
+                appDelegate.showDictationShortcut()
+            }
+
             Divider()
 
             Button("Quit GemmaBar") {

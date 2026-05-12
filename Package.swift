@@ -49,7 +49,7 @@ let package = Package(
             name: "GemmaBar",
             dependencies: [],
             path: "Sources/GemmaBar",
-            exclude: ["Info.plist"]
+            exclude: ["Info.plist", "GemmaBar.entitlements"]
         ),
         // ── DFlash Kernel Micro-Benchmark ───────────────────────────
         .executableTarget(

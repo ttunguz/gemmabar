@@ -13,6 +13,9 @@ MACOS_DIR="$APP_PATH/Contents/MacOS"
 
 BUNDLE_MODELS="${BUNDLE_MODELS:-0}"
 BUNDLE_PARAKEET="${BUNDLE_PARAKEET:-0}"
+SIGN_IDENTITY="${SIGN_IDENTITY:-${GEMMABAR_SIGN_IDENTITY:--}}"
+ENTITLEMENTS="${ENTITLEMENTS:-Sources/GemmaBar/GemmaBar.entitlements}"
+VERIFY_GATEKEEPER="${VERIFY_GATEKEEPER:-0}"
 
 DICTATION_MODEL="${DICTATION_MODEL:-$HOME/Documents/coding/MLX/models/gemma-4-e4b-it-4bit}"
 PARAKEET_VENV="${PARAKEET_VENV:-$HOME/Documents/coding/parakeet/.venv}"
@@ -71,7 +74,26 @@ if [[ "$BUNDLE_PARAKEET" == "1" ]]; then
 fi
 
 chmod +x "$MACOS_DIR/GemmaBar" "$RESOURCES_DIR/SwiftLM/SwiftLM"
-codesign --force --deep --sign - "$APP_PATH"
+
+codesign_common_args=(--force --strict --options runtime --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" == "Developer ID Application:"* ]]; then
+  codesign_common_args+=(--timestamp)
+else
+  codesign_common_args+=(--timestamp=none)
+fi
+
+echo "==> Signing with identity: $SIGN_IDENTITY"
+while IFS= read -r -d '' metallib; do
+  codesign "${codesign_common_args[@]}" "$metallib"
+done < <(find "$APP_PATH/Contents" -type f -name '*.metallib' -print0)
+codesign "${codesign_common_args[@]}" "$RESOURCES_DIR/SwiftLM/SwiftLM"
+codesign "${codesign_common_args[@]}" --entitlements "$ENTITLEMENTS" "$MACOS_DIR/GemmaBar"
+codesign "${codesign_common_args[@]}" --entitlements "$ENTITLEMENTS" "$APP_PATH"
+
+codesign --verify --strict --verbose=4 "$APP_PATH"
+if [[ "$VERIFY_GATEKEEPER" == "1" ]]; then
+  spctl --assess --type execute --verbose=4 "$APP_PATH"
+fi
 
 echo "==> Bundle complete"
 echo "App: $APP_PATH"

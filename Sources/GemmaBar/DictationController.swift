@@ -204,6 +204,8 @@ final class DictationController: NSObject, ObservableObject {
     }
 
     private func cleanWithGemma(transcript: String) async throws -> String {
+        try await serverController.ensureModelLoaded(.dictation)
+
         let port = serverController.port
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
         var request = URLRequest(url: url)

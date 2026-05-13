@@ -68,6 +68,40 @@ final class ServerController: ObservableObject {
         await loadModel(defaultMode)
     }
 
+    func ensureModelLoaded(_ mode: GemmaBarMode) async throws {
+        let profile = ModelRegistry.profile(for: mode)
+
+        if await serverIsReady(port: profile.defaultPort) {
+            currentMode = mode
+            currentModelName = profile.displayName
+            port = profile.defaultPort
+            defaultMode = mode
+            state = .ready
+            return
+        }
+
+        if state.isLoading {
+            if await waitForServer(port: profile.defaultPort, timeout: 60) {
+                currentMode = mode
+                currentModelName = profile.displayName
+                port = profile.defaultPort
+                defaultMode = mode
+                state = .ready
+                return
+            }
+        } else {
+            await loadModel(mode)
+            if await serverIsReady(port: profile.defaultPort) {
+                return
+            }
+        }
+
+        if case .error(let message) = state {
+            throw GemmaBarError.serverUnavailable(message)
+        }
+        throw GemmaBarError.serverStartTimeout(port: profile.defaultPort)
+    }
+
     func loadModel(_ mode: GemmaBarMode) async {
         guard !state.isLoading else { return }
 
@@ -324,6 +358,7 @@ final class ServerController: ObservableObject {
 enum GemmaBarError: LocalizedError {
     case binaryNotFound(String)
     case serverStartTimeout(port: Int)
+    case serverUnavailable(String)
 
     var errorDescription: String {
         switch self {
@@ -331,6 +366,8 @@ enum GemmaBarError: LocalizedError {
             return "swiftlm binary not found at \(path). Install from SharpAI/SwiftLM releases."
         case .serverStartTimeout(let port):
             return "Server failed to start on port \(port) within timeout."
+        case .serverUnavailable(let message):
+            return "Server unavailable: \(message)"
         }
     }
 }

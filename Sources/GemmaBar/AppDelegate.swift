@@ -15,11 +15,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     var serverController: ServerController!
     var dictationController: DictationController!
     private var customVocabularyWindow: NSWindow?
+    private var pasteTestWindow: NSWindow?
+    private var pasteTestTextView: NSTextView?
     private var cancellables = Set<AnyCancellable>()
     private var f2HotKeyRef: EventHotKeyRef?
     private var f2HotKeyHandlerRef: EventHandlerRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if ProcessInfo.processInfo.environment["GEMMABAR_PASTE_SELF_TEST"] == "1" {
+            runPasteSelfTest()
+            return
+        }
+
         NSApp.setActivationPolicy(.accessory)
 
         serverController = ServerController()
@@ -38,6 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         installF2DictationHotkey()
         requestAccessibilityPermissionForPaste()
+        requestInputMonitoringPermissionForPaste()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -47,7 +55,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         if let f2HotKeyHandlerRef {
             RemoveEventHandler(f2HotKeyHandlerRef)
         }
-        serverController.stopServer()
+        serverController?.stopServer()
     }
 
     private func installF2DictationHotkey() {
@@ -104,6 +112,124 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         ] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
         DictationController.log("Accessibility trusted for paste=\(trusted)")
+    }
+
+    private func requestInputMonitoringPermissionForPaste() {
+        let trustedBefore = CGPreflightListenEventAccess()
+        if !trustedBefore {
+            let requested = CGRequestListenEventAccess()
+            DictationController.log("Input Monitoring requested=\(requested)")
+        }
+        let trustedAfter = CGPreflightListenEventAccess()
+        DictationController.log("Input Monitoring trusted for paste=\(trustedAfter)")
+    }
+
+    private func runPasteSelfTest() {
+        NSApp.setActivationPolicy(.regular)
+        installPasteSelfTestMenu()
+
+        let environment = ProcessInfo.processInfo.environment
+        let marker = environment["GEMMABAR_PASTE_MARKER"] ?? "GemmaBar paste self-test"
+        let resultPath = environment["GEMMABAR_PASTE_RESULT"] ?? "/tmp/gemmabar-paste-self-test-result"
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 300, y: 300, width: 640, height: 240),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "GemmaBar Paste Self-Test"
+
+        let scrollView = NSScrollView(frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 640, height: 240))
+        scrollView.autoresizingMask = [.width, .height]
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.font = .systemFont(ofSize: 18)
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        window.contentView = scrollView
+
+        pasteTestWindow = window
+        pasteTestTextView = textView
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        window.makeFirstResponder(textView)
+
+        NSPasteboard.general.clearContents()
+        let clipboardWritten = NSPasteboard.general.setString(marker, forType: .string)
+        DictationController.log("Paste self-test clipboardWritten=\(clipboardWritten); markerChars=\(marker.count)")
+
+        // Wait longer for window to fully initialize
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            // Verify permissions before paste
+            let axTrusted = AXIsProcessTrusted()
+            let inputTrusted = CGPreflightListenEventAccess()
+            DictationController.log("Paste self-test permissions: AX=\(axTrusted); InputMonitoring=\(inputTrusted)")
+
+            NSApp.activate(ignoringOtherApps: true)
+            NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            self?.pasteTestWindow?.makeKeyAndOrderFront(nil)
+            self?.pasteTestWindow?.makeFirstResponder(self?.pasteTestTextView)
+            let target = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+            let firstResponder = String(describing: self?.pasteTestWindow?.firstResponder)
+            DictationController.log("Paste self-test before paste target=\(target); firstResponder=\(firstResponder)")
+
+            // Try CGEvent-based paste first
+            DictationController.pasteClipboardIntoFrontmostApp()
+        }
+
+        // Check if CGEvent paste worked after delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            let cgEventResult = self?.pasteTestTextView?.string ?? ""
+            DictationController.log("Paste self-test CGEvent result: chars=\(cgEventResult.count)")
+
+            // If CGEvent didn't work, try NSText.paste as fallback
+            if cgEventResult.isEmpty {
+                DictationController.log("Paste self-test: CGEvent paste failed, trying NSText.paste fallback")
+                self?.pasteTestTextView?.paste(nil)
+            }
+        }
+
+        // Final check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            let result = self?.pasteTestTextView?.string ?? ""
+            try? result.write(toFile: resultPath, atomically: true, encoding: .utf8)
+            let cgEventWorked = result.contains(marker) && result.count == marker.count
+            DictationController.log("Paste self-test resultChars=\(result.count); matched=\(result.contains(marker)); cgEventWorked=\(cgEventWorked)")
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func installPasteSelfTestMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(
+            NSMenuItem(
+                title: "Quit GemmaBar",
+                action: #selector(NSApplication.terminate(_:)),
+                keyEquivalent: "q"
+            )
+        )
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(
+            NSMenuItem(
+                title: "Paste",
+                action: #selector(NSText.paste(_:)),
+                keyEquivalent: "v"
+            )
+        )
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
     }
 }
 

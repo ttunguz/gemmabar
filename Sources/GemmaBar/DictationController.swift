@@ -128,11 +128,8 @@ final class DictationController: NSObject, ObservableObject {
             state = .cleaning
             let cleaned = normalizeDictationTerms(try await cleanWithGemma(transcript: transcript))
             lastTranscript = cleaned
-            NSPasteboard.general.clearContents()
-            let clipboardWritten = NSPasteboard.general.setString(cleaned, forType: .string)
-            Self.log("Dictation cleaned \(cleaned.count) chars; clipboardWritten=\(clipboardWritten)")
             state = .idle
-            Self.pasteClipboardIntoFrontmostApp()
+            Self.insertTextIntoFrontmostApp(cleaned)
         } catch {
             Self.log("Dictation failed: \(error.localizedDescription)")
             state = .error(error.localizedDescription)
@@ -219,7 +216,7 @@ final class DictationController: NSObject, ObservableObject {
             messages: [
                 .init(
                     role: "system",
-                    content: "Clean up this speech transcript. Fix punctuation, capitalization, spacing, and obvious transcription errors. Preserve every sentence and every repeated phrase; do not summarize, deduplicate, shorten, reorder, or omit content. Preserve the speaker's meaning and style. Normalize these terms exactly: GemmaBar, SwiftLM, Parakeet, Tomasz, Theory Ventures. Output only the cleaned transcript. Do not include reasoning, notes, markdown, or commentary."
+                    content: "Clean up this speech transcript. Fix punctuation, capitalization, spacing, and obvious transcription errors. Remove filler words and conversational greetings at the start (e.g. 'okay', 'hi', 'so', 'um', 'uh', 'alright', 'hey') that are not part of the intended message. Preserve the speaker's intended meaning, style, and all substantive content. Do not summarize, reorder, or omit substantive content. Normalize these terms exactly: GemmaBar, SwiftLM, Parakeet, Tomasz, Theory Ventures. Output only the cleaned transcript. Do not include reasoning, notes, markdown, or commentary."
                 ),
                 .init(role: "user", content: transcript)
             ],
@@ -317,21 +314,165 @@ final class DictationController: NSObject, ObservableObject {
         }
     }
 
-    private nonisolated static func pasteClipboardIntoFrontmostApp() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            let source = CGEventSource(stateID: .combinedSessionState)
-            let commandKey = CGEventFlags.maskCommand
-            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
-            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
-            keyDown?.flags = commandKey
-            keyUp?.flags = commandKey
-            keyDown?.post(tap: .cghidEventTap)
-            keyUp?.post(tap: .cghidEventTap)
+    nonisolated static func insertTextIntoFrontmostApp(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        let snapshot = capturePasteboardSnapshot(pasteboard)
+        pasteboard.clearContents()
+        let clipboardWritten = pasteboard.setString(text, forType: .string)
+        let clipboardReadback = pasteboard.string(forType: .string) ?? ""
+        log(
+            "Dictation cleaned \(text.count) chars; clipboardWritten=\(clipboardWritten); clipboardReadback=\(clipboardReadback.count) chars; changeCount=\(pasteboard.changeCount)"
+        )
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+            if insertTextWithAccessibility(text) {
+                restorePasteboardSnapshot(snapshot, to: pasteboard)
+                return
+            }
+            pasteClipboardIntoFrontmostApp()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                restorePasteboardSnapshot(snapshot, to: pasteboard)
+            }
         }
+    }
+
+    private nonisolated static func insertTextWithAccessibility(_ text: String) -> Bool {
+        guard AXIsProcessTrusted() else {
+            log("Dictation AX insert skipped: accessibilityTrusted=false")
+            return false
+        }
+
+        let target = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+
+        // Skip AX insertion for terminal apps - they report success but don't actually insert
+        // These apps work better with CGEvent Cmd+V paste
+        let terminalApps = ["kitty", "Terminal", "iTerm2", "Alacritty", "Warp", "Hyper", "WezTerm"]
+        if terminalApps.contains(where: { target.localizedCaseInsensitiveContains($0) }) {
+            log("Dictation AX insert skipped for terminal app: \(target)")
+            return false
+        }
+
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var focusedValue: CFTypeRef?
+        let focusedError = AXUIElementCopyAttributeValue(
+            systemWideElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedValue
+        )
+        guard focusedError == .success, let focusedValue else {
+            log("Dictation AX insert failed: focusedElementError=\(focusedError.rawValue)")
+            return false
+        }
+
+        let focusedElement = focusedValue as! AXUIElement
+        var roleValue: CFTypeRef?
+        _ = AXUIElementCopyAttributeValue(focusedElement, kAXRoleAttribute as CFString, &roleValue)
+        let role = (roleValue as? String) ?? "unknown"
+
+        let selectedTextError = AXUIElementSetAttributeValue(
+            focusedElement,
+            kAXSelectedTextAttribute as CFString,
+            text as CFTypeRef
+        )
+        if selectedTextError == .success {
+            log("Dictation inserted text via AXSelectedText into \(target); role=\(role); chars=\(text.count)")
+            return true
+        }
+
+        log("Dictation AXSelectedText insert failed: error=\(selectedTextError.rawValue); role=\(role)")
+        return false
+    }
+
+    nonisolated static func pasteClipboardIntoFrontmostApp() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+            let target = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+            let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+
+            // Use AppleScript for paste — more reliable than CGEvent for terminal apps
+            let script = NSAppleScript(source: """
+                tell application "System Events"
+                    keystroke "v" using command down
+                end tell
+                """)
+            var errorInfo: NSDictionary?
+            script?.executeAndReturnError(&errorInfo)
+
+            if let errorInfo {
+                log("Dictation AppleScript paste failed for \(target) pid=\(pid): \(errorInfo)")
+                // Fall back to CGEvent
+                pasteWithCGEvent(target: target, pid: pid)
+            } else {
+                log("Dictation pasted via AppleScript to \(target) pid=\(pid)")
+            }
+        }
+    }
+
+    private nonisolated static func pasteWithCGEvent(target: String, pid: pid_t) {
+        let source = CGEventSource(stateID: .combinedSessionState)
+        guard source != nil else {
+            log("Dictation CGEvent paste failed: Could not create CGEventSource")
+            return
+        }
+        source?.localEventsSuppressionInterval = 0
+
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+
+        guard keyDown != nil, keyUp != nil else {
+            log("Dictation CGEvent paste failed: Could not create CGEvent")
+            return
+        }
+
+        keyDown?.flags = .maskCommand
+        keyUp?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        usleep(15_000)
+        keyUp?.post(tap: .cghidEventTap)
+
+        log("Dictation posted CGEvent Cmd+V to \(target) pid=\(pid)")
+    }
+
+    private nonisolated static func capturePasteboardSnapshot(_ pasteboard: NSPasteboard) -> PasteboardSnapshot? {
+        guard let pasteboardItems = pasteboard.pasteboardItems, !pasteboardItems.isEmpty else {
+            return nil
+        }
+
+        let items = pasteboardItems.compactMap { item -> PasteboardItemSnapshot? in
+            let dataByType = item.types.compactMap { type -> (NSPasteboard.PasteboardType, Data)? in
+                guard let data = item.data(forType: type) else { return nil }
+                return (type, data)
+            }
+            return dataByType.isEmpty ? nil : PasteboardItemSnapshot(dataByType: dataByType)
+        }
+
+        return items.isEmpty ? nil : PasteboardSnapshot(items: items)
+    }
+
+    private nonisolated static func restorePasteboardSnapshot(_ snapshot: PasteboardSnapshot?, to pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        guard let snapshot else { return }
+
+        let items = snapshot.items.map { snapshotItem -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in snapshotItem.dataByType {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        pasteboard.writeObjects(items)
+        log("Dictation restored clipboard items=\(items.count)")
     }
 }
 
 extension DictationController: AVAudioRecorderDelegate {}
+
+private struct PasteboardItemSnapshot {
+    let dataByType: [(NSPasteboard.PasteboardType, Data)]
+}
+
+private struct PasteboardSnapshot {
+    let items: [PasteboardItemSnapshot]
+}
 
 private struct ParakeetResponse: Decodable {
     let text: String

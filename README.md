@@ -1,6 +1,6 @@
-# ⚡️ SwiftLM
+# ⚡️ SwiftLM + GemmaBar
 
-A blazingly fast, native Swift inference server that serves [MLX](https://github.com/ml-explore/mlx) models with a strict **OpenAI-compatible API**. 
+A blazingly fast, native Swift inference server that serves [MLX](https://github.com/ml-explore/mlx) models with a strict **OpenAI-compatible API** — plus **GemmaBar**, a macOS menu bar app for voice dictation powered by on-device speech-to-text and LLM cleanup.
 
 No Python runtime, no Global Interpreter Lock (GIL), no unnecessary memory copies. Just bare-metal Apple Silicon performance compiled to a single binary.
 
@@ -11,6 +11,131 @@ No Python runtime, no Global Interpreter Lock (GIL), no unnecessary memory copie
 <p align="center">
   <img src="docs/demo.gif" width="320" alt="SwiftBuddy iOS demo" />
 </p>
+
+---
+
+## 🎙️ GemmaBar — Voice Dictation for macOS
+
+GemmaBar is a macOS menu bar application that provides system-wide voice dictation. Press **F2** to start recording, speak, press **F2** again — your cleaned text is pasted into the frontmost application.
+
+### How It Works
+
+GemmaBar runs a three-stage pipeline entirely on-device :
+
+```
+[Microphone] → [Parakeet STT] → [Gemma LLM Cleanup] → [Paste into App]
+     F2 start      ~1-2s              ~0.2s               instant
+```
+
+1. **Record** — AVFoundation captures 16kHz mono WAV audio
+2. **Transcribe** — [Parakeet](https://github.com/nvidia/parakeet) (NVIDIA's MLX speech-to-text model) converts audio to raw text
+3. **Clean** — Gemma 4 (running on SwiftLM) fixes punctuation, capitalization, strips filler words ("um", "okay", "so"), and normalizes terms
+4. **Paste** — Text is inserted into the frontmost app via the most reliable method available
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│                   GemmaBar.app                   │
+│                  (Menu Bar App)                   │
+│                                                   │
+│  ┌─────────────┐   ┌──────────┐   ┌───────────┐ │
+│  │  AppDelegate │   │ Dictation│   │  Server   │ │
+│  │  F2 Hotkey   │──▶│Controller│──▶│Controller │ │
+│  │  Permissions │   │          │   │           │ │
+│  └─────────────┘   └────┬─────┘   └─────┬─────┘ │
+│                          │               │        │
+│            ┌─────────────┼───────────────┘        │
+│            │             │                        │
+│            ▼             ▼                        │
+│  ┌──────────────┐  ┌──────────────┐              │
+│  │   Parakeet    │  │   SwiftLM    │              │
+│  │  (External)   │  │  (Embedded)  │              │
+│  │  parakeet-mlx │  │  Port 8087   │              │
+│  │  NVIDIA STT   │  │  Gemma 4     │              │
+│  └──────────────┘  └──────────────┘              │
+│                                                   │
+│  ┌───────────────────────────────────────────┐   │
+│  │           Paste Strategy                   │   │
+│  │                                            │   │
+│  │  1. Accessibility API (AXSelectedText)     │   │
+│  │     ✓ Chrome, TextEdit, Safari, etc.       │   │
+│  │     ✗ Terminal apps (report false success)  │   │
+│  │                                            │   │
+│  │  2. AppleScript System Events (Cmd+V)      │   │
+│  │     ✓ kitty, iTerm2, Terminal, Alacritty   │   │
+│  │     ✓ All standard apps as fallback        │   │
+│  │                                            │   │
+│  │  3. CGEvent Cmd+V (last resort fallback)   │   │
+│  └───────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────┘
+```
+
+### Paste Strategy — What We Learned
+
+Getting text into the frontmost app is harder than it sounds. Three methods, each with trade-offs :
+
+| Method | Works For | Fails For | Why |
+|---|---|---|---|
+| **Accessibility API** (AXSelectedText) | Chrome, TextEdit, Safari, most GUI apps | kitty, iTerm2, Terminal, Alacritty | Terminal apps report success but silently ignore the write |
+| **AppleScript** (System Events keystroke) | All apps including terminals | None observed | Routes through macOS event dispatch properly |
+| **CGEvent** (raw keyboard event) | TextEdit, some apps | Terminal apps, Claude Code | Events don't route through the app's event loop reliably |
+
+GemmaBar uses a **three-tier fallback** :
+1. Try Accessibility API first (preserves clipboard, no Cmd+V side effects)
+2. If the app is a terminal (kitty, iTerm2, etc.) or AX fails → AppleScript `keystroke "v" using command down`
+3. If AppleScript fails → CGEvent Cmd+V as last resort
+
+The clipboard is snapshot/restored after paste so the user's clipboard isn't clobbered.
+
+### Gemma Cleanup Prompt
+
+The LLM cleanup stage strips filler words and fixes transcription artifacts :
+
+- **Removes** : "okay", "hi", "um", "uh", "so", "alright", "hey" from the start
+- **Fixes** : punctuation, capitalization, spacing
+- **Normalizes** : project-specific terms (GemmaBar, SwiftLM, Parakeet, etc.)
+- **Preserves** : all substantive content, speaker style, meaning
+
+Example :
+```
+Parakeet raw:  "Okay, let's see if this is working."
+Gemma cleaned: "Let's see if this is working."
+```
+
+### Requirements
+
+- macOS 14.0+ with Apple Silicon
+- **Accessibility** permission (System Settings → Privacy → Accessibility)
+- **Input Monitoring** permission (System Settings → Privacy → Input Monitoring)
+- **Microphone** permission
+- [Parakeet MLX](https://github.com/nvidia/parakeet) installed at `~/Documents/coding/parakeet/.venv/bin/parakeet-mlx`
+- Gemma 4 model at `~/Documents/coding/MLX/models/gemma-4-e4b-it-4bit`
+- `default.metallib` and `mlx.metallib` in the same directory as the SwiftLM binary
+
+### Quick Start
+
+```bash
+# Build
+./build.sh
+
+# Run (launches menu bar app with F2 hotkey)
+.build/debug/GemmaBar
+
+# Or run the release build
+.build/release/GemmaBar
+```
+
+Press **F2** → speak → press **F2** → text appears in your active app.
+
+### Logs
+
+All activity is logged to `/tmp/gemmabar.log` :
+```bash
+tail -f /tmp/gemmabar.log
+```
+
+Log output shows both the raw Parakeet transcription and the Gemma-cleaned result for debugging.
 
 ---
 

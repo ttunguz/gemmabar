@@ -124,9 +124,11 @@ final class DictationController: NSObject, ObservableObject {
         do {
             state = .transcribing
             let transcript = try await Self.transcribeWithParakeet(audioURL: recordingURL)
+            Self.log("Dictation Parakeet raw: \(transcript)")
 
             state = .cleaning
             let cleaned = normalizeDictationTerms(try await cleanWithGemma(transcript: transcript))
+            Self.log("Dictation Gemma cleaned: \(cleaned)")
             lastTranscript = cleaned
             state = .idle
             Self.insertTextIntoFrontmostApp(cleaned)

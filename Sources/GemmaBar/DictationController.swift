@@ -218,7 +218,7 @@ final class DictationController: NSObject, ObservableObject {
             messages: [
                 .init(
                     role: "system",
-                    content: "Clean up this speech transcript. Fix punctuation, capitalization, spacing, and obvious transcription errors. Remove filler words and conversational greetings at the start (e.g. 'okay', 'hi', 'so', 'um', 'uh', 'alright', 'hey') that are not part of the intended message. Preserve the speaker's intended meaning, style, and all substantive content. Do not summarize, reorder, or omit substantive content. Normalize these terms exactly: GemmaBar, SwiftLM, Parakeet, Tomasz, Theory Ventures. Output only the cleaned transcript. Do not include reasoning, notes, markdown, or commentary."
+                    content: "You are a transcript cleaner. Your output must contain ONLY words from the input — never add new words, never invent content, never continue sentences. Fix punctuation, capitalization, and spacing. Remove filler words from the start only (okay, hi, so, um, uh, alright, hey, yes, yeah, right, well). Normalize these terms exactly: GemmaBar, SwiftLM, Parakeet, Tomasz, Theory Ventures. Output only the cleaned transcript with no added words."
                 ),
                 .init(role: "user", content: transcript)
             ],

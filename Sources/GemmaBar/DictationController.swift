@@ -127,8 +127,23 @@ final class DictationController: NSObject, ObservableObject {
             Self.log("Dictation Parakeet raw: \(transcript)")
 
             state = .cleaning
-            let cleaned = normalizeDictationTerms(try await cleanWithGemma(transcript: transcript))
-            Self.log("Dictation Gemma cleaned: \(cleaned)")
+            let gemmaOutput = try await cleanWithGemma(transcript: transcript)
+            Self.log("Dictation Gemma raw output: \(gemmaOutput)")
+
+            // If Gemma returns something that shares no words with the original transcript,
+            // it hallucinated. Fall back to the raw transcript with basic cleanup.
+            let cleaned: String
+            let transcriptWords = Set(transcript.lowercased().split(separator: " ").map { $0.trimmingCharacters(in: .punctuationCharacters) })
+            let gemmaWords = Set(gemmaOutput.lowercased().split(separator: " ").map { $0.trimmingCharacters(in: .punctuationCharacters) })
+            let overlap = transcriptWords.intersection(gemmaWords)
+
+            if overlap.isEmpty && !gemmaOutput.isEmpty {
+                Self.log("Dictation Gemma hallucinated (no word overlap), using raw transcript")
+                cleaned = normalizeDictationTerms(transcript)
+            } else {
+                cleaned = normalizeDictationTerms(gemmaOutput)
+            }
+            Self.log("Dictation final output: \(cleaned)")
             lastTranscript = cleaned
             state = .idle
             Self.insertTextIntoFrontmostApp(cleaned)

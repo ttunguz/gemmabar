@@ -8,6 +8,34 @@ import SwiftUI
 struct GemmaBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var audioManager = AudioDeviceManager.shared
+    @State private var waveformFrame = 0
+    @State private var waveformTimer: Timer?
+
+    /// SF Symbols that cycle during recording to create a subtle waveform animation.
+    private static let waveformIcons = [
+        "waveform",
+        "waveform.badge.mic",
+        "waveform",
+        "waveform.badge.mic"
+    ]
+
+    private var menuBarIcon: String {
+        guard let dictation = appDelegate.dictationController else {
+            return "megaphone.fill"
+        }
+        switch dictation.state {
+        case .recording:
+            return Self.waveformIcons[waveformFrame % Self.waveformIcons.count]
+        case .transcribing:
+            return "text.bubble"
+        case .cleaning:
+            return "sparkles"
+        case .error:
+            return "exclamationmark.triangle.fill"
+        case .idle:
+            return "megaphone.fill"
+        }
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -79,12 +107,35 @@ struct GemmaBarApp: App {
             }
             .keyboardShortcut("q")
         } label: {
-            Label("GemmaBar", systemImage: "megaphone.fill")
+            Image(systemName: menuBarIcon)
         }
         .menuBarExtraStyle(.menu)
+        .onChange(of: appDelegate.dictationController?.state ?? .idle) { _, newState in
+            if newState.isRecording {
+                startWaveformAnimation()
+            } else {
+                stopWaveformAnimation()
+            }
+        }
 
         Settings {
             EmptyView()
         }
+    }
+
+    private func startWaveformAnimation() {
+        waveformFrame = 0
+        waveformTimer?.invalidate()
+        waveformTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            Task { @MainActor in
+                waveformFrame += 1
+            }
+        }
+    }
+
+    private func stopWaveformAnimation() {
+        waveformTimer?.invalidate()
+        waveformTimer = nil
+        waveformFrame = 0
     }
 }
